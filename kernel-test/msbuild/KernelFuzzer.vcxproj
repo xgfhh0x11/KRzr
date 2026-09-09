@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  KernelFuzzer.vcxproj  -  modern WDK 10 / MSBuild driver project.
+
+  The repo's only shipped build path (src/sources + src/build.bat) drives
+  the legacy WDK 7.1-era "build -ceZ" tool, which most current WDK/VS
+  installs no longer carry (see ../../BUILD_AND_VERIFY.md Section 3.1/Section 3.2/Section 3.3  - 
+  this file is exactly the "not yet done" fallback described there: "hand-
+  author a modern KMDF .vcxproj that compiles kernel_fuzzer.c with
+  ntoskrnl.lib and hal.lib"). The driver itself is WDM, not KMDF (raw
+  IoCreateDevice/PsCreateSystemThread/KSPIN_LOCK, no WdfDriverCreate), so
+  DriverType below is WDM to match src/sources' DRIVERTYPE=WDM.
+
+  Compiles the SAME source the legacy path compiles (../../src/kernel_fuzzer.c)
+   -  nothing under src/ is modified or duplicated. Requires the "Windows
+  Driver Kit" Visual Studio extension (WindowsKernelModeDriver10.0 platform
+  toolset) to be installed alongside MSBuild; if it is not, MSBuild fails
+  with a clear toolset-not-found error rather than silently doing nothing  - 
+  see kernel-test/build.ps1, which surfaces that error verbatim and exits
+  non-zero instead of reporting fake success.
+-->
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6C1E7A2E-6E8B-4E6C-9E0B-6B1B6A6D9F31}</ProjectGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <RootNamespace>KernelFuzzer</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <TargetName>KernelFuzzer</TargetName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <UseWpp>false</UseWpp>
+    <Spectre>false</Spectre>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <!--
+        src/sources builds with /W4 /WX (warnings-as-errors). Kept here too
+        so build.ps1's result matches the repo's own documented standard  - 
+        do not weaken this to hide warnings; BUILD_AND_VERIFY.md Section build/test
+        reality already flags that /WX may legitimately fail on the dead
+        code / unused-function definitions and the reported Priority
+        unsigned-underflow. A failure here is real signal, not noise.
+      -->
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <PreprocessorDefinitions>DRIVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\src\kernel_fuzzer.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\src\kernel_fuzzer.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

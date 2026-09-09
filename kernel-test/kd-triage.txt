@@ -1,0 +1,134 @@
+KRzr  -  kd.exe triage command reference
+=======================================
+Copy/paste templates only. This file is not executed by anything; it is
+notes for the operator's kd session against the guest. Nothing here
+connects to a VM on its own  -  see README.md for how to open the session.
+
+------------------------------------------------------------------------
+0. Attach (from the host, WDK/Debugging Tools installed)
+------------------------------------------------------------------------
+Get <PORT>/<KEY> from inside the guest first:
+    bcdedit /dbgsettings
+
+Then from the host:
+    kd -k net:port=<PORT>,key=<KEY>
+
+First things to run once the session breaks in (Ctrl+Break or on a bugcheck):
+    .sympath srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+    .reload
+    kv                      ; current stack, one line per frame
+    vertarget               ; confirm guest OS build matches expectations
+
+------------------------------------------------------------------------
+1. Module / symbol sanity for KernelFuzzer.sys
+------------------------------------------------------------------------
+    lm m KernelFuzzer               ; is the driver loaded, what base/size
+    .reload /f KernelFuzzer.sys     ; force-reload symbols for the driver
+    x KernelFuzzer!*                ; list its symbols once loaded
+    !drvobj KernelFuzzer 2          ; driver object + dispatch table
+
+------------------------------------------------------------------------
+2. On a bugcheck (the expected failure mode for a race fuzzer)
+------------------------------------------------------------------------
+    !analyze -v                     ; primary triage  -  always run first
+    kv                               ; faulting stack
+    .bugcheck                        ; bugcheck code + 4 parameters again
+    !thread                          ; current thread detail
+    !process 0 0                     ; process list if relevant
+
+For the specific bug classes this driver is documented to have (see
+../README.md "What actually runs" / repo review):
+
+  Use-after-return / use-after-free (stack context handed to a thread or
+  inserted into a global list, e.g. CreateFuzzingThreads /
+  CreateFuzzingResources / SynthesizeFaultPatterns):
+    !analyze -v                     ; look for "special pool" or a freed-
+                                     ; stack-address pattern in the faulting
+                                     ; access
+    !pool <address> 2                ; is <address> pool, and what tag
+    !poolused 4 FZAR                 ; KRzr's own pool tag - live allocations
+
+  Double-free / corrupted list (SynthesizeFaultPatterns reinserting the
+  same node into g_PatternList every loop iteration):
+    !analyze -v                     ; look for LIST_ENTRY corruption /
+                                     ; "Special Pool Detected" if Verifier on
+    dt nt!_LIST_ENTRY <address>      ; inspect a suspect list node by hand
+
+  Unload race (DriverUnload/CleanupResources does not wait for
+  FuzzingLoop/ThreadWorker to exit before IoDeleteDevice):
+    !thread                          ; is a KernelFuzzer thread still
+                                      ; running post-unload
+    lm m KernelFuzzer                ; confirm whether the module is still
+                                      ; resident when the crashing thread's
+                                      ; return address points into it
+
+------------------------------------------------------------------------
+3. Lock / race diagnostics
+------------------------------------------------------------------------
+KernelFuzzer uses raw KSPIN_LOCKs (g_FuzzingLock, g_ThreadLock,
+g_ResourceLock, g_RaceLock, g_PatternLock, g_CoverageLock, plus the
+Eraser-style lockset in LocksetInit/AnalyzeLockset)  -  not ERESOURCE, so
+!locks (ERESOURCE-only) will normally show nothing useful here; !qlocks
+covers the systemwide queued spinlocks KSPIN_LOCK compiles down to on
+x64. Try both, !qlocks is the one likely to be relevant:
+
+    !qlocks                          ; queued spinlock state systemwide
+    !locks                           ; ERESOURCE locks (likely empty for
+                                      ; this driver, check anyway)
+    !locks -v                        ; verbose, if !locks shows anything
+
+    !running -it                     ; what's running on each processor  - 
+                                      ; useful to catch a spinning
+                                      ; ThreadWorker mid-race
+    ~* kv                            ; stacks for every thread in the
+                                      ; current process, or:
+    !process 0 7                     ; full detail incl. thread list for
+                                      ; the process driving client.py
+
+    !deadlock                        ; only meaningful with Driver Verifier
+                                      ; deadlock detection enabled (below);
+                                      ; otherwise reports "not enabled"
+
+------------------------------------------------------------------------
+4. Driver Verifier (enable BEFORE loading, from an elevated guest prompt)
+------------------------------------------------------------------------
+Recommended flags for this driver: standard checks + special pool +
+deadlock detection, scoped to KernelFuzzer.sys only (system-wide Verifier
+on a kdnet guest is usable but noisier):
+
+    verifier /flags 0x0009 /driver KernelFuzzer.sys
+        ; 0x1 = Special Pool, 0x8 = Deadlock Detection
+    verifier /querysettings         ; confirm it took
+    shutdown /r /t 0                ; Verifier flag changes need a reboot
+
+After reboot, load the driver (load.ps1 -Arm) and reattach kd. On a
+Verifier-caught bug the guest bugchecks immediately at the offending
+access with the specific Verifier bugcheck code (e.g. 0xC1 SPECIAL_POOL_
+DETECTED_MEMORY_CORRUPTION, 0xC4 DRIVER_VERIFIER_DETECTED_VIOLATION)  - 
+run !analyze -v exactly as in Section 2.
+
+To turn Verifier off again before reverting/retiring the checkpoint:
+    verifier /reset
+    shutdown /r /t 0
+
+------------------------------------------------------------------------
+5. IOCTL-path / race-window inspection while it's running
+------------------------------------------------------------------------
+    bp KernelFuzzer!DeviceControl              ; break on every IOCTL
+    bp KernelFuzzer!CreateFuzzingThreads        ; the documented UAR site
+    bp KernelFuzzer!SynthesizeFaultPatterns     ; the documented list-
+                                                 ; corruption site
+    bp KernelFuzzer!CleanupResources            ; watch what it does (and
+                                                 ; does not) free on unload
+    g                                            ; go
+    bl                                            ; list breakpoints
+    bc *                                          ; clear all breakpoints
+
+------------------------------------------------------------------------
+6. End of session
+------------------------------------------------------------------------
+    qd                                ; quit and leave the guest running
+
+If the guest bugchecked or behaved unexpectedly: do not reuse it  -  revert
+the Hyper-V checkpoint (see README.md SAFETY) rather than rebooting and
+continuing in place.
