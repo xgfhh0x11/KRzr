@@ -1,0 +1,39 @@
+# Build outputs
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.sys
+*.cat
+*.pfx
+*.cer
+
+# Visual Studio user/state (NOT project files)
+.vs/
+*.vcxproj.user
+*.suo
+
+# Driver build output trees
+x64/Release/
+x64/Debug/
+Release/
+Debug/
+
+# Logs
+*.log
+*.wrn
+*.err
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

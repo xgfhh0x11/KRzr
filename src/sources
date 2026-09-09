@@ -1,0 +1,21 @@
+TARGETNAME=KernelFuzzer
+TARGETTYPE=DRIVER
+DRIVERTYPE=WDM
+
+SOURCES=kernel_fuzzer.c
+
+TARGETLIBS=$(DDK_LIB_PATH)\ntoskrnl.lib \
+           $(DDK_LIB_PATH)\hal.lib
+
+INCLUDES=.
+
+# Define preprocessor symbols
+C_DEFINES=$(C_DEFINES) -DDRIVER
+
+# Enable warnings as errors
+MSC_WARNING_LEVEL=/W4 /WX
+
+# Enable debug information
+!IF "$(DDKBUILDENV)" == "chk"
+C_DEFINES=$(C_DEFINES) -DDBG=1
+!ENDIF
