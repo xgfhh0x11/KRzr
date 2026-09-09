@@ -1,9 +1,9 @@
 # KRzr — Build & Verification
 
-> *Last updated: 2026-05-14 — post P0–P3 fix pass.*
-
-> *Quality gate for the HBO NL portfolio. This file answers:
-> "Is this project buildable, runnable, and behaving as documented?"*
+> *This file answers: "Is this project buildable, runnable, and behaving
+> as documented?" The repo ships as a single commit, so there is no
+> incremental fix history to point to — this document describes the
+> current state only.*
 
 KRzr is a Windows kernel-mode race-condition fuzzer. It consists of a
 single-translation-unit WDM driver (`src/kernel_fuzzer.c`,
@@ -109,23 +109,33 @@ No third-party libraries. No `pip install` step. No package manifest
   `\Device\KernelFuzzer` with symbolic link `\DosDevices\KernelFuzzer`
   (confirmed in `kernel_fuzzer.c` line 350/354), exposing the control
   surface `\\.\KernelFuzzer` to user mode.
-- The driver implements five cooperating modules described in the README:
-  1. **Thread Interleaving Simulator** — `PsCreateSystemThread`, CPU
-     affinity / priority, `KeDelayExecutionThread`-based jitter.
-  2. **Shared Resource Mutator** — kernel pool, file, registry, named
-     pipe, section, mutex, event, semaphore objects (enum
-     `RESOURCE_TYPE` in `kernel_fuzzer.h`).
-  3. **Race Detector** — per-thread lockset analysis; emits
-     `RACE_CONDITION` records with `CORRUPTION_TYPE` classification
-     (`RecordMemoryAccess`, `RecordLockAcquisition`, `AnalyzeLockset` in
-     the header).
-  4. **Fault Pattern Generator** — `SynthesizeFaultPattern` produces
-     classification records (`FAULT_PATTERN_TYPE`: UAF, double-free,
-     heap-spray, ROP-chain neighbourhood, privilege escalation, code
-     injection); per the README and the type name, these are bug-class
-     *classifications*, not weaponised payloads.
-  5. **Coverage Tracker** — instruction-coverage bitmap; feedback into
-     the mutator (`AddInput`, `MutateInput`, `CalculateCoverageGain`).
+- The source is organized around five module-shaped groups of functions
+  (see the README), but **only a thin slice is actually wired into the
+  running fuzzing loop** — see README "What actually runs" for the exact
+  breakdown. In summary:
+  1. **Thread Interleaving Simulator** — wired: `PsCreateSystemThread`,
+     CPU affinity / priority, `KeDelayExecutionThread`-based jitter.
+  2. **Shared Resource Mutator** — wired: kernel pool, file, registry,
+     named pipe, section, mutex, event, semaphore objects (enum
+     `RESOURCE_TYPE`).
+  3. **Race Detector** — partially wired: the lockset path
+     (`RecordMemoryAccess`, `RecordLockAcquisition` → Eraser-style
+     state machine) runs on fixed synthetic addresses via
+     `SimulateThreadRace`. `AnalyzeLockset` and the shadow-table
+     memory-safety detectors (UAF/double-free/etc.) are defined but
+     never called.
+  4. **Fault Pattern Generator** — partially wired: `SynthesizeFaultPattern`
+     runs, but only ever emits `FAULT_PATTERN_USE_AFTER_FREE` records in
+     practice (its switch hard-codes that type from the caller, and its
+     `default` case also falls back to UAF). The other five
+     `FAULT_PATTERN_TYPE` generators (heap-spray, ROP-chain, privilege
+     escalation, code injection, double-free) are defined but never
+     called from that switch.
+  5. **Coverage Tracker** — partially wired: `UpdateCoverage`/
+     `HitCoveragePoint` run against a synthetic address, not real
+     instrumentation. The Module-5 mutation/feedback engine (`AddInput`,
+     `MutateInput`, `CalculateCoverageGain`, …) is defined but never
+     called — there is no coverage-guided feedback loop in the run path.
 - The user-mode `client.py` opens `\\.\KernelFuzzer`, sends
   `IOCTL_START_FUZZING` with a packed `FUZZING_CONFIG`, then polls
   `IOCTL_GET_STATUS` / `IOCTL_GET_COVERAGE` /
@@ -234,28 +244,23 @@ See §3.3 for the proposed automated harness.
 
 ### 3.1 Known fragilities
 
-- ~~**README does not document test-signing or `signtool` steps.**~~
-  **RESOLVED 2026-05-14.** `SIGNING.md` now ships at the project root
-  with the full 5-step test-signing recipe (`bcdedit /set testsigning on`
-  → `New-SelfSignedCertificate` with `makecert` fallback →
+- **Test-signing is documented.** `SIGNING.md` ships at the project root
+  with a 5-step test-signing recipe (`bcdedit /set testsigning on` →
+  `New-SelfSignedCertificate` with `makecert` fallback →
   `Export-Certificate` + `certutil -addstore Root/TrustedPublisher` →
   `signtool sign /fd SHA256` → install + verify), a troubleshooting
-  table, and a tear-down section. The README Build section explicitly
-  references `SIGNING.md` and warns about `ERROR_INVALID_IMAGE_HASH`
-  (`0xC0000428`).
+  table, and a tear-down section. The README Build section references
+  `SIGNING.md` and warns about `ERROR_INVALID_IMAGE_HASH` (`0xC0000428`).
 - **Legacy `sources`/`build.exe` toolchain is deprecated.** Modern WDK
   10 installs default to MSBuild + `.vcxproj`. `build.bat` probes
   `setenv.cmd` under the **WDK 10** path (`Windows Kits\10\bin\x64`)
   but invokes the **WDK 7.1-era** `build -ceZ` command — these are
   inconsistent on most modern installs. ⚠️
-  ~~The `sources` file also declares `DRIVERTYPE=WDM` (not `KMDF`),
-  despite the README calling the driver "KMDF".~~
-  **RESOLVED 2026-05-14.** Implementation grep confirms `DriverEntry`
-  + `IRP_MJ_*` dispatch with no `WdfDriverCreate`; the driver is WDM.
-  README has been corrected from "KMDF" to "WDM" to match `sources`
-  (`DRIVERTYPE=WDM`) and the C source's raw WDM primitives
-  (`IoCreateDevice`, `PsCreateSystemThread`, `KSPIN_LOCK`,
-  `KeDelayExecutionThread`).
+- **Driver type is WDM, not KMDF.** Implementation grep confirms
+  `DriverEntry` + `IRP_MJ_*` dispatch with no `WdfDriverCreate`; the
+  README and `sources` (`DRIVERTYPE=WDM`) agree on "WDM", matching the
+  C source's raw WDM primitives (`IoCreateDevice`,
+  `PsCreateSystemThread`, `KSPIN_LOCK`, `KeDelayExecutionThread`).
 - **Output path is hard-coded** (`objfre_win7_amd64\amd64\KernelFuzzer.sys`)
   in both `build.bat` (echo only) and `install.bat` (actual
   `sc create binPath=…`). If the WDK build environment selects a
@@ -267,18 +272,19 @@ See §3.3 for the proposed automated harness.
   but does not state it explicitly.
 - **No `.inf` file.** Although `sc create type= kernel` is sufficient
   for legacy driver loading, distribution via WHQL / driver-store
-  install (`pnputil`, `INF`) is not possible without one. Not strictly
-  a fragility for an HBO research artefact, but it limits the install
-  flow to the legacy SCM path.
-- **No `DriverUnload` audit in the repo summary** — the header declares
-  `VOID DriverUnload(...)` but the .c file is 37 KB and was not read in
-  full; the README claims tear-down works. Trust-but-verify: confirm
-  that `sc stop KernelFuzzer` returns 0 *and* that all `'FZAR'`-tagged
-  pool allocations are freed (use `!poolused 4 FZAR` in WinDbg). ⚠️
-- **`client.py` mixed-language comments.** Several docstrings remain in
-  Turkish (`"Fuzzing durumu"`, `"Status callback fonksiyonu"`, `"10 saniye
-  bekle"`). Functionally harmless, but inconsistent with the
-  English-language README and a minor portfolio polish item.
+  install (`pnputil`, `INF`) is not possible without one. This limits
+  the install flow to the legacy SCM path.
+- **`DriverUnload`/`CleanupResources` do not fully tear down.**
+  `CleanupResources()` frees the coverage-point and fault-pattern
+  lists but never frees `g_ThreadList` or `g_ResourceList` (their
+  `DestroyFuzzingThread`/`DestroyResource` counterparts are declared in
+  `kernel_fuzzer.c` but never implemented or called), and
+  `DriverUnload()` does not wait for `FuzzingLoop` or any
+  `ThreadWorker` thread to exit before deleting the device — threads
+  still running after unload touch freed globals / unloaded code. This
+  is a known correctness gap, not verified-safe teardown; confirm with
+  WinDbg (`!poolused 4 FZAR`) before trusting `sc stop KernelFuzzer` /
+  unload on a live VM. ⚠️
 - **Driver has no kernel-side bound checks on user buffer sizes** for
   some IOCTLs (e.g. `IOCTL_SIMULATE_RACE` receives a variable-length
   `thread_ids` array). This is a kernel-attack-surface concern even on
@@ -295,8 +301,8 @@ See §3.3 for the proposed automated harness.
   itself is build-system-agnostic.
 - **No kernel-debug VM**: limit verification to §2.4 static checks plus
   `python -c "import src.client; print('import ok')"` — this verifies
-  the orchestrator parses but cannot exercise any kernel path. Document
-  this clearly in the portfolio cover sheet.
+  the orchestrator parses but cannot exercise any kernel path. State
+  this limitation plainly wherever this project's status is reported.
 - **Cannot test-sign**: an alternative on Windows 10/11 dev hosts is
   `bcdedit /set nointegritychecks on` (deprecated, may not work on
   modern builds with Secure Boot) — last resort; prefer the
@@ -307,38 +313,48 @@ See §3.3 for the proposed automated harness.
 
 ### 3.3 Roadmap
 
-- **Short-term (≤1 day)**:
-  - ~~Add an explicit *"Signing & test-signing"* section to `README.md`~~
-    **DONE 2026-05-14** — `SIGNING.md` shipped at project root with the
-    full 5-step recipe; README Build section references it and warns
-    about `ERROR_INVALID_IMAGE_HASH` (`0xC0000428`).
-  - ~~Fix README's KMDF/WDM mismatch (`sources` says `DRIVERTYPE=WDM`;
-    the README claims KMDF).~~
-    **DONE 2026-05-14** — README updated to "WDM" after implementation
-    grep confirmed `DriverEntry` + `IRP_MJ_*` (no `WdfDriverCreate`).
-  - ~~Add a `python -m py_compile` smoke test and a one-liner README
-    "Verify" section pointing at it.~~ **DONE 2026-06-10** — README now
-    has a "Verify" section; `py_compile` runs in CI and a `tests/`
-    pytest suite checks structure + the `client.py` driver contract.
-  - ~~Add `cd /d "%~dp0"` to `install.bat` and `uninstall.bat` so they
-    work regardless of the caller's CWD.~~ **DONE 2026-06-10** — both
-    scripts now `cd /d "%~dp0"` (also fixes the `%CD%`-based `binPath`
-    in `install.bat`); locked in by `tests/test_structure.py`.
-- **Medium-term (≤1 week)**:
+- **Already in the repo**:
+  - `SIGNING.md` ships at project root with the 5-step test-signing
+    recipe; README Build section references it and warns about
+    `ERROR_INVALID_IMAGE_HASH` (`0xC0000428`).
+  - README and `sources` agree the driver is WDM (not KMDF).
+  - README has a "Verify" section; `py_compile` runs in CI and a
+    `tests/` pytest suite (25 cases) checks structure and the
+    `client.py` IOCTL/config contract, including mocking
+    `kernel32.DeviceIoControl` to exercise the packed-struct round-trips
+    (`tests/test_client_ioctl.py`): the 8-ULONG config sent on
+    `IOCTL_START_FUZZING` and the 9-ULONG status parsed from
+    `IOCTL_GET_STATUS`.
+  - `install.bat` / `uninstall.bat` `cd /d "%~dp0"` first, so they work
+    regardless of the caller's CWD (also fixes the `%CD%`-based
+    `binPath` in `install.bat`); locked in by `tests/test_structure.py`.
+  - `IOCTL_ALLOCATE_MEMORY`, `IOCTL_FREE_MEMORY`, `IOCTL_GET_COVERAGE`,
+    and `IOCTL_GET_FAULT_PATTERNS` now have real implementations behind
+    them (previously `status = STATUS_SUCCESS` no-ops that left the
+    client's output buffers zeroed); `IOCTL_CREATE_MUTEX` and
+    `IOCTL_SIMULATE_RACE` remain intentional no-ops (no client-side
+    caller/output contract exists to implement against — see comments
+    at their `DeviceControl` case).
+  - The three use-after-return bugs in `CreateFuzzingThreads`,
+    `CreateFuzzingResources`, and `SynthesizeFaultPatterns` (stack
+    locals handed to global lists / live threads) are fixed by
+    heap-allocating the contexts instead.
+- **Not yet done**:
   - Ship a modern WDK 10 MSBuild `KernelFuzzer.vcxproj` alongside the
     legacy `sources` file so reviewers with a stock WDK install can
     build without installing the legacy environment.
-  - **DONE 2026-06-10** — a `pytest` suite for `client.py` asserts the
-    IOCTL codes and `FuzzingConfig` defaults (`tests/test_client.py`)
-    **and** mocks `kernel32.DeviceIoControl` to exercise the packed-struct
-    round-trips (`tests/test_client_ioctl.py`): the 8-ULONG config sent on
-    `IOCTL_START_FUZZING` and the 9-ULONG status parsed from
-    `IOCTL_GET_STATUS` — the exact place a user/kernel struct-layout drift
-    against `kernel_fuzzer.h` would hide.
   - Pin IOCTL codes in `client.py` against the `CTL_CODE` expansion of
     `kernel_fuzzer.h` in a generated header (`ioctls.py`) to prevent
-    drift.
-- **Long-term**:
+    drift — moot until `kernel_fuzzer.h`'s struct layouts are reconciled
+    with the `.c` file's local definitions (see the note at the top of
+    `kernel_fuzzer.h`).
+  - Real thread teardown: reference and wait on every `ThreadWorker` /
+    `FuzzingLoop` thread before `DriverUnload` frees anything (see §3.1).
+  - Wire the shadow-table memory-safety detectors, `AnalyzeLockset`, the
+    Module-5 mutation/feedback engine, and the Module-4 exploit-pattern
+    generators into a live path, or remove them if they are not going to
+    be — see README "What actually runs" for the current list of
+    defined-but-dead code.
   - Provide a Vagrant / Hyper-V automation script that builds a
     test-signing-enabled Windows VM, deploys `KernelFuzzer.sys`, runs
     `client.py` for a fixed campaign, harvests fault-pattern records,
@@ -357,8 +373,8 @@ See §3.3 for the proposed automated harness.
 |-------|--------|-------|
 | README documents build | ✅ | README §Build lists `build.bat` / `install.bat` / `client.py` / `uninstall.bat`, references the `sources` file, references `SIGNING.md` for the test-signing recipe, and warns about `ERROR_INVALID_IMAGE_HASH` (`0xC0000428`). |
 | Build files present | ✅ | `src/build.bat`, `src/install.bat`, `src/uninstall.bat`, `src/sources` all exist. |
-| Build files internally consistent | ⚠️ | `build.bat` probes the WDK 10 `setenv.cmd` path but invokes the WDK 7.1 `build -ceZ` legacy flow. Output path `objfre_win7_amd64\amd64` is hard-coded in both `build.bat` and `install.bat` — consistent with each other but brittle vs. modern WDK build-tree layouts. (KMDF/WDM mismatch resolved 2026-05-14 — README now matches `sources` `DRIVERTYPE=WDM`.) |
+| Build files internally consistent | ⚠️ | `build.bat` probes the WDK 10 `setenv.cmd` path but invokes the WDK 7.1 `build -ceZ` legacy flow. Output path `objfre_win7_amd64\amd64` is hard-coded in both `build.bat` and `install.bat` — consistent with each other but brittle vs. modern WDK build-tree layouts. (README and `sources` agree on `DRIVERTYPE=WDM` — no KMDF/WDM mismatch.) |
 | Source structure matches README | ✅ | README (now correctly) describes a single-file WDM driver + Python client; repo has `kernel_fuzzer.c` (37 KB) + `kernel_fuzzer.h` + `client.py`. README's five-module breakdown maps cleanly to enums/prototypes in `kernel_fuzzer.h`. |
-| Tests exist | ✅ | `tests/` (pytest): `test_structure.py` (documented files + CWD-independence of the service scripts) and `test_client.py` (imports `client.py`, asserts `FuzzingConfig` defaults + IOCTL codes vs the driver contract). 22 passed locally. Driver self-test IOCTL still absent (needs a kernel VM). |
+| Tests exist | ✅ | `tests/` (pytest): `test_structure.py` (documented files + CWD-independence of the service scripts), `test_client.py` (imports `client.py`, asserts `FuzzingConfig` defaults + IOCTL codes vs the values hard-coded in `kernel_fuzzer.c`), and `test_client_ioctl.py` (mocked `DeviceIoControl` packed-struct round-trips). 25 passed locally. Driver self-test IOCTL still absent (needs a kernel VM); zero kernel code is exercised by this suite. |
 | Test invocation documented | ✅ | README has a "Verify" section (`py_compile` + `pytest`); CI (`.github/workflows/ci.yml`, `windows-latest`) runs both. The manual driver flow (`build.bat` → `SIGNING.md` → `install.bat` → `client.py` → `uninstall.bat`) remains documented for the privileged path. |
 | Output artifacts named in build files | ✅ | `src/sources` declares `TARGETNAME=KernelFuzzer` and `TARGETTYPE=DRIVER`; `build.bat` echoes and `install.bat` consumes the path `objfre_win7_amd64\amd64\KernelFuzzer.sys`. |

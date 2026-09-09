@@ -6,12 +6,14 @@ sequences, and concurrency-sensitive use-after-free / double-free
 patterns.
 
 The implementation is a single-file WDM kernel driver paired with a
-Python client. The driver runs five cooperating modules; the client
-drives campaigns and aggregates results.
+Python client. The source defines five module-shaped groups of
+functions; **only a thin slice of that surface is actually wired into
+the running fuzzing loop** (see "What actually runs" below). The client
+drives campaigns and polls status/coverage/pattern IOCTLs.
 
 ---
 
-## Modules
+## Modules (as designed — see "What actually runs" for what is wired)
 
 1. **Thread Interleaving Simulator.** Creates kernel system threads
    (`PsCreateSystemThread`), assigns CPU affinity / priority, and
@@ -30,9 +32,44 @@ drives campaigns and aggregates results.
    neighbourhood / ROP-chain neighbourhood / privilege-context delta
    / code-injection candidate). The record is a *classification*, not
    a weaponised payload.
-5. **Coverage Tracker.** Maintains an instruction-coverage bitmap fed
-   back into the mutator to bias future trials toward unexplored
-   code paths.
+5. **Coverage Tracker.** Maintains an instruction-coverage bitmap; the
+   source also defines a mutation/feedback engine intended to bias
+   future trials toward unexplored code paths.
+
+## What actually runs
+
+`FuzzingIteration()` (the body of the per-iteration loop) only exercises:
+`GenerateInput` (allocates a random buffer, never consumed), 
+`CreateFuzzingResources`/`CreateFuzzingThreads` (module 1/2 object
+creation), `UpdateCoverage` (a synthetic address, not real
+instrumentation), `DetectRaceConditions`, `SynthesizeFaultPatterns`,
+`UpdateStatistics`. The one detector that genuinely runs is the lockset
+path: `ThreadWorker → SimulateThreadRace → RecordMemoryAccess` /
+`RecordLockAcquisition`, feeding **fixed synthetic addresses**, not real
+kernel state. Fault synthesis is hard-wired to
+`FAULT_PATTERN_USE_AFTER_FREE` — the other five `FaultPatternType`
+classes are defined but never emitted by a running campaign.
+
+**Defined but never called from any live path** (compiles, but does not
+run): the shadow-table memory-safety detectors (`DetectUseAfterFree`,
+`DetectDoubleFree`, `DetectUninitializedMemory`, `DetectBufferOverflow`,
+`DetectNullPointerDeref`, `DetectIntegerOverflow` — their shadow table is
+never populated because `ShadowMark` is never called); `AnalyzeLockset`;
+the Module-5 mutation/feedback engine (`AddInput`, `GetNextInput`,
+`MutateInput` and its `BitFlip…HavocMutation` mutators,
+`CalculateCoverageGain`, `IsInterestingInput`); and the Module-4
+exploit-pattern generators (`GenerateHeapSprayPattern`,
+`GenerateRopChainPattern`, `GeneratePrivilegeEscalationPattern`,
+`GenerateCodeInjectionPattern`, `CalculatePatternConfidence`,
+`ValidateFaultPattern`). `SimulateRaceCondition` (invoked every iteration
+via `SimulateRaceConditions`) is an unimplemented stub. Each of these is
+marked `NOT WIRED` / `STUB` in the source at its definition.
+
+In short: the "coverage bitmap fed back into the mutator" feedback loop
+described above as the design intent does not exist in the run path
+today, and the fault-pattern classifier only ever emits UAF records in
+practice. Treat the five-module list as the architecture the code is
+organized around, not as a description of what a live campaign produces.
 
 ## Architecture
 
@@ -96,10 +133,16 @@ python -m pytest tests\ -v                 :: structure + client contract
 
 `tests/` asserts the documented files are present, that `install.bat` /
 `uninstall.bat` are CWD-independent, and that `client.py`'s
-`FuzzingConfig` defaults and IOCTL codes match the driver contract in
-`kernel_fuzzer.h`. CI (`.github/workflows/ci.yml`) runs exactly this on
-`windows-latest`. Importing `client.py` is safe — its device I/O is
-under the `if __name__ == "__main__"` guard.
+`FuzzingConfig` defaults and IOCTL codes match the values hard-coded in
+`kernel_fuzzer.c`'s `DeviceControl` dispatch (checked by value, not
+against `kernel_fuzzer.h` — see the note at the top of that header: its
+struct layouts have drifted from the `.c` file's local definitions, so
+it is documentation, not the compiled contract). 25 tests pass locally
+and in CI (`.github/workflows/ci.yml`, `windows-latest`). Importing
+`client.py` is safe — its device I/O is under the
+`if __name__ == "__main__"` guard. None of this exercises kernel code;
+it cannot catch the kernel-side bugs described in "What actually runs"
+above.
 
 ## Threat Model and Scope
 
@@ -127,22 +170,41 @@ It does:
 
 ## Status
 
-Research / non-production. The driver is intended for use on a
-dedicated kernel-debug VM. Output is meant for analyst review, not
-for downstream automation.
+Research / non-production, and pre-alpha in capability: only the thin
+slice described in "What actually runs" is wired up; most of the module
+surface is defined but not called (see above). The driver is intended
+for use on a dedicated kernel-debug VM. Output is meant for analyst
+review, not for downstream automation. This has not been built or run
+on a kernel VM as part of this revision — see BUILD_AND_VERIFY.md for
+what has and has not been verified.
 
 ## Limitations
 
+- Only a thin slice of the described module surface is wired into the
+  running fuzzing loop; see "What actually runs" above for exactly what
+  executes versus what is defined-but-dead.
 - Race detection is bounded by the lockset abstraction; pure
-  happens-before races without lock pairing may go unflagged.
+  happens-before races without lock pairing may go unflagged. The
+  lockset path itself only ever sees fixed synthetic addresses, not
+  real kernel state.
 - The synthetic shared resources are a small set; coverage of the
   full kernel object zoo is out of scope for the current revision.
 - No automated test harness — the driver requires a privileged kernel
   environment to exercise; static testability is limited to the
-  Python client.
+  Python client and the repo structure (25 pytest cases, zero kernel
+  code coverage).
 - Reported success probabilities in the fault-pattern records are
   heuristic; treat them as classification confidences, not exploit
-  feasibility scores.
+  feasibility scores. In practice only the UAF pattern class is ever
+  emitted by a running campaign (see "What actually runs").
+- `IOCTL_CREATE_THREAD`'s client method (`create_thread`) sends a
+  4-byte thread ID but the driver requires a full `THREAD_CONTEXT`
+  (`inputBufferLength >= sizeof(THREAD_CONTEXT)`), so it always returns
+  `STATUS_INVALID_PARAMETER` — that client method cannot currently
+  succeed.
+- The device is created with `FILE_ANY_ACCESS` and no SDDL/ACL, so any
+  user on the box can issue IOCTLs; this is a known open attack surface
+  for a tool that should only run on an isolated, single-operator VM.
 
 ## References
 

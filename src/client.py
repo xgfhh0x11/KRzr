@@ -83,7 +83,7 @@ class FuzzingConfig:
 
 @dataclass
 class FuzzingStatus:
-    """Fuzzing durumu"""
+    """Fuzzing status"""
     is_running: bool = False
     iterations_completed: int = 0
     crashes_found: int = 0
@@ -218,10 +218,10 @@ class KernelFuzzerClient:
 
     def stop_fuzzing(self) -> bool:
         """
-        Kernel seviyesinde fuzzing'i durdurur.
-        
+        Stop fuzzing at the kernel level.
+
         Returns:
-            Fuzzing durduruldu mu
+            Whether fuzzing was stopped
         """
         try:
             if not self.driver_handle:
@@ -256,9 +256,9 @@ class KernelFuzzerClient:
     def get_status(self) -> Optional[FuzzingStatus]:
         """
         Read kernel-level fuzzing status.
-        
+
         Returns:
-            Fuzzing durumu
+            Fuzzing status
         """
         try:
             if not self.driver_handle:
@@ -317,7 +317,7 @@ class KernelFuzzerClient:
         Start monitoring fuzzing status.
         
         Args:
-            callback: Status callback fonksiyonu
+            callback: Status callback function
         """
         if self.monitoring_active:
             return
@@ -333,7 +333,7 @@ class KernelFuzzerClient:
         self.logger.info("Monitoring started")
 
     def stop_monitoring(self):
-        """Fuzzing durumu izlemeyi durdurur."""
+        """Stop monitoring fuzzing status."""
         self.monitoring_active = False
         
         if self.monitoring_thread:
@@ -357,7 +357,7 @@ class KernelFuzzerClient:
                         f"Coverage={status.coverage_percentage}%"
                     )
                 
-                time.sleep(1)  # 1 saniyede bir kontrol et
+                time.sleep(1)  # check once per second
                 
             except Exception as e:
                 self.logger.error(f"Monitoring error: {e}")
@@ -408,10 +408,10 @@ class KernelFuzzerClient:
 
     def allocate_memory(self, size: int) -> Optional[int]:
         """
-        Kernel seviyesinde memory allocate eder.
-        
+        Allocate memory at the kernel level.
+
         Args:
-            size: Allocation boyutu
+            size: Allocation size
             
         Returns:
             Allocated memory address
@@ -441,7 +441,7 @@ class KernelFuzzerClient:
             )
             
             if result:
-                # Address'i parse et
+                # Parse the address
                 address = struct.unpack("Q", response_buffer.raw[:8])[0]
                 self.logger.debug(f"Memory allocated in kernel: 0x{address:x}")
                 return address
@@ -456,13 +456,13 @@ class KernelFuzzerClient:
 
     def free_memory(self, address: int) -> bool:
         """
-        Kernel seviyesinde memory free eder.
-        
+        Free memory at the kernel level.
+
         Args:
-            address: Free edilecek address
-            
+            address: Address to free
+
         Returns:
-            Memory free edildi mi
+            Whether the memory was freed
         """
         try:
             if not self.driver_handle:
@@ -502,7 +502,7 @@ class KernelFuzzerClient:
         Simulate a race condition at the kernel level.
         
         Args:
-            race_type: Race condition tipi
+            race_type: Race condition type
             thread_ids: Participating thread IDs
             
         Returns:
@@ -548,9 +548,9 @@ class KernelFuzzerClient:
     def get_coverage_stats(self) -> Optional[Dict[str, int]]:
         """
         Read coverage statistics.
-        
+
         Returns:
-            Coverage istatistikleri
+            Coverage statistics
         """
         try:
             if not self.driver_handle:
@@ -574,7 +574,7 @@ class KernelFuzzerClient:
             )
             
             if result:
-                # Coverage data parse et
+                # Parse the coverage data
                 total_points, hit_points, percentage = struct.unpack("III", coverage_buffer.raw[:12])
                 
                 return {
@@ -594,9 +594,9 @@ class KernelFuzzerClient:
     def get_fault_pattern_stats(self) -> Optional[Dict[str, int]]:
         """
         Read fault-pattern statistics.
-        
+
         Returns:
-            FaultPattern istatistikleri
+            Fault-pattern statistics
         """
         try:
             if not self.driver_handle:
@@ -620,7 +620,7 @@ class KernelFuzzerClient:
             )
             
             if result:
-                # FaultPattern data parse et
+                # Parse the fault-pattern data
                 total_patterns, high_confidence_patterns = struct.unpack("II", pattern_buffer.raw[:8])
                 
                 return {
@@ -646,11 +646,11 @@ class KernelFuzzerClient:
         self.disconnect()
 
 def main():
-    """Test fonksiyonu"""
+    """Test function"""
     logging.basicConfig(level=logging.INFO)
     
     def status_callback(status: FuzzingStatus):
-        """Status callback fonksiyonu"""
+        """Status callback function"""
         print(f"Status: Iterations={status.iterations_completed}, "
               f"Races={status.race_conditions_detected}, "
               f"Patterns={status.patterns_found}, "
@@ -677,13 +677,13 @@ def main():
             # Start monitoring
             client.start_monitoring(status_callback)
             
-            # 10 saniye bekle
+            # wait 10 seconds
             time.sleep(10)
-            
-            # Monitoring durdur
+
+            # stop monitoring
             client.stop_monitoring()
-            
-            # Fuzzing durdur
+
+            # stop fuzzing
             client.stop_fuzzing()
             print("Kernel fuzzing stopped")
             

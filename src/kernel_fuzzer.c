@@ -326,6 +326,7 @@ NTSTATUS GenerateROPChain(PVOID Buffer, ULONG BufferSize, PVOID TargetAddress);
 NTSTATUS GenerateHeapSpray(PVOID Buffer, ULONG BufferSize, PVOID TargetAddress);
 NTSTATUS GenerateUseAfterFreePattern(PRACE_CONDITION Race, PFAULT_PATTERN Pattern);
 NTSTATUS GenerateDoubleFreePattern(PRACE_CONDITION Race, PFAULT_PATTERN Pattern);
+NTSTATUS GetFaultPatternStats(PULONG TotalPatterns, PULONG HighConfidencePatterns);
 
 // Coverage tracking (Module 5: Coverage Tracker & Feedback Loop)
 NTSTATUS AddInput(PVOID InputData, ULONG InputSize);
@@ -515,40 +516,114 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             
         case IOCTL_CREATE_THREAD:
             if (inputBufferLength >= sizeof(THREAD_CONTEXT)) {
-                status = CreateFuzzingThread((PTHREAD_CONTEXT)inputBuffer);
+                // The IRP system buffer is only valid for the lifetime of
+                // this call, but CreateFuzzingThread() hands the context to
+                // an asynchronous system thread (ThreadWorker) and links it
+                // into the global g_ThreadList, both of which outlive this
+                // IOCTL. Copy it to a heap block we own instead of aliasing
+                // the I/O manager's buffer (same use-after-return class as
+                // the CreateFuzzingThreads() bug below).
+                PTHREAD_CONTEXT threadCtx = (PTHREAD_CONTEXT)ExAllocatePoolWithTag(
+                    NonPagedPool, sizeof(THREAD_CONTEXT), RACE_FUZZER_TAG);
+                if (threadCtx) {
+                    RtlCopyMemory(threadCtx, inputBuffer, sizeof(THREAD_CONTEXT));
+                    status = CreateFuzzingThread(threadCtx);
+                    if (!NT_SUCCESS(status)) {
+                        ExFreePoolWithTag(threadCtx, RACE_FUZZER_TAG);
+                    }
+                } else {
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                }
             } else {
                 status = STATUS_INVALID_PARAMETER;
             }
             break;
-            
+
         case IOCTL_CREATE_MUTEX:
-            // Mutex creation logic
+            // No client-side caller exists for this IOCTL (client.py has no
+            // create_mutex() method and defines no output layout for it),
+            // so there is no unambiguous contract to fill an output buffer
+            // against. Left as a status-only no-op rather than guessing at
+            // a shape; see README "Status" section.
             status = STATUS_SUCCESS;
             break;
-            
+
         case IOCTL_ALLOCATE_MEMORY:
-            // Memory allocation logic
-            status = STATUS_SUCCESS;
+            // client.py allocate_memory() sends a 4-byte ULONG size and
+            // expects an 8-byte pointer back (struct.unpack("Q", ...)).
+            if (inputBufferLength >= sizeof(ULONG) &&
+                outputBufferLength >= sizeof(PVOID)) {
+                ULONG allocSize = *(PULONG)inputBuffer;
+                PVOID address = NULL;
+
+                if (allocSize == 0 || allocSize > (1024 * 1024)) {
+                    status = STATUS_INVALID_PARAMETER;
+                } else {
+                    status = AllocateKernelPool(allocSize, RACE_FUZZER_TAG, &address);
+                    if (NT_SUCCESS(status)) {
+                        // Overwrite the (already-consumed) input bytes with
+                        // the output pointer; METHOD_BUFFERED shares one
+                        // system buffer for input and output.
+                        *(PVOID*)outputBuffer = address;
+                        Irp->IoStatus.Information = sizeof(PVOID);
+                    }
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
             break;
-            
+
         case IOCTL_FREE_MEMORY:
-            // Memory free logic
-            status = STATUS_SUCCESS;
+            // client.py free_memory() sends an 8-byte address (struct.pack
+            // ("Q", address)) and reads no output.
+            if (inputBufferLength >= sizeof(PVOID)) {
+                PVOID address = *(PVOID*)inputBuffer;
+
+                if (IsAddressValid(address)) {
+                    ExFreePoolWithTag(address, RACE_FUZZER_TAG);
+                    status = STATUS_SUCCESS;
+                } else {
+                    status = STATUS_INVALID_PARAMETER;
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
             break;
-            
+
         case IOCTL_SIMULATE_RACE:
-            // Race simulation logic
+            // client.py simulate_race() reads no output for this IOCTL
+            // (output buffer/length are NULL/0), so there is nothing to
+            // fill here. SimulateRaceCondition() itself is an intentional
+            // no-op stub — see its definition and README "Status".
             status = STATUS_SUCCESS;
             break;
-            
+
         case IOCTL_GET_COVERAGE:
-            // Coverage statistics
-            status = STATUS_SUCCESS;
+            // client.py get_coverage_stats() expects 3 packed ULONGs
+            // (total_points, hit_points, percentage).
+            if (outputBufferLength >= 3 * sizeof(ULONG)) {
+                PULONG out = (PULONG)outputBuffer;
+                status = GetCoverageStats(&out[0], &out[1], &out[2]);
+                if (NT_SUCCESS(status)) {
+                    Irp->IoStatus.Information = 3 * sizeof(ULONG);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
             break;
-            
+
         case IOCTL_GET_FAULT_PATTERNS:
-            // Pattern statistics
-            status = STATUS_SUCCESS;
+            // client.py get_fault_pattern_stats() expects 2 packed ULONGs
+            // (total_patterns, high_confidence_patterns).
+            if (outputBufferLength >= 2 * sizeof(ULONG)) {
+                PULONG out = (PULONG)outputBuffer;
+                status = GetFaultPatternStats(&out[0], &out[1]);
+                if (NT_SUCCESS(status)) {
+                    Irp->IoStatus.Information = 2 * sizeof(ULONG);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
             break;
             
         default:
@@ -723,30 +798,52 @@ VOID GenerateInput(PVOID* InputData, PULONG InputSize)
 // Create fuzzing resources
 VOID CreateFuzzingResources(VOID)
 {
-    RESOURCE_CONTEXT context;
+    PRESOURCE_CONTEXT context;
     ULONG i;
-    
+
     for (i = 0; i < 5; i++) { // Create 5 resources per iteration
-        RtlZeroMemory(&context, sizeof(RESOURCE_CONTEXT));
-        context.ResourceType = (RESOURCE_TYPE)(i % 4);
-        context.ResourceId = InterlockedIncrement(&g_ResourceCounter);
-        
-        CreateResource(context.ResourceType, &context);
+        // Heap-allocate: CreateResource() links &context->ListEntry into
+        // the global g_ResourceList, which outlives this function's stack
+        // frame. A stack local here is a use-after-return.
+        context = (PRESOURCE_CONTEXT)ExAllocatePoolWithTag(
+            NonPagedPool, sizeof(RESOURCE_CONTEXT), RACE_FUZZER_TAG);
+        if (!context) {
+            continue;
+        }
+        RtlZeroMemory(context, sizeof(RESOURCE_CONTEXT));
+        context->ResourceType = (RESOURCE_TYPE)(i % 4);
+        context->ResourceId = InterlockedIncrement(&g_ResourceCounter);
+
+        CreateResource(context->ResourceType, context);
     }
 }
 
 // Create fuzzing threads
 VOID CreateFuzzingThreads(VOID)
 {
-    THREAD_CONTEXT context;
+    PTHREAD_CONTEXT context;
     ULONG i;
-    
+    NTSTATUS status;
+
     for (i = 0; i < 3; i++) { // Create 3 threads per iteration
-        RtlZeroMemory(&context, sizeof(THREAD_CONTEXT));
-        context.ThreadId = InterlockedIncrement(&g_ThreadCounter);
-        context.Priority = (ULONG)(KeQueryTimeIncrement() % 5) - 2; // -2 to 2
-        
-        CreateFuzzingThread(&context);
+        // Heap-allocate: CreateFuzzingThread() hands this pointer to a live
+        // system thread (ThreadWorker) and links it into g_ThreadList, both
+        // of which outlive this function's stack frame. A stack local here
+        // is a use-after-return that corrupts the list and hands the
+        // worker thread a dangling pointer.
+        context = (PTHREAD_CONTEXT)ExAllocatePoolWithTag(
+            NonPagedPool, sizeof(THREAD_CONTEXT), RACE_FUZZER_TAG);
+        if (!context) {
+            continue;
+        }
+        RtlZeroMemory(context, sizeof(THREAD_CONTEXT));
+        context->ThreadId = InterlockedIncrement(&g_ThreadCounter);
+        context->Priority = (ULONG)(KeQueryTimeIncrement() % 5) - 2; // -2 to 2
+
+        status = CreateFuzzingThread(context);
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(context, RACE_FUZZER_TAG);
+        }
     }
 }
 
@@ -772,24 +869,36 @@ VOID SynthesizeFaultPatterns(VOID)
 {
     PLIST_ENTRY entry;
     PRACE_CONDITION race;
-    FAULT_PATTERN pattern;
+    PFAULT_PATTERN pattern;
     KIRQL oldIrql;
-    
+
     KeAcquireSpinLock(&g_RaceLock, &oldIrql);
-    
+
     for (entry = g_RaceList.Flink; entry != &g_RaceList; entry = entry->Flink) {
         race = CONTAINING_RECORD(entry, RACE_CONDITION, ListEntry);
-        
+
         if (race->PatternPotential) {
-            RtlZeroMemory(&pattern, sizeof(FAULT_PATTERN));
-            pattern.PayloadId = InterlockedIncrement(&g_PatternCounter);
-            pattern.PatternType = FAULT_PATTERN_USE_AFTER_FREE;
-            pattern.SuccessProbability = 70;
-            
-            SynthesizeFaultPattern(race, &pattern);
+            // Heap-allocate per iteration: SynthesizeFaultPattern() links
+            // &pattern->ListEntry into the global g_PatternList, which
+            // CleanupResources() later frees with ExFreePoolWithTag(). A
+            // single reused stack local here both dangles past this
+            // function's return and double-links the same node into the
+            // list on every loop pass (freeing a stack address on unload
+            // is a guaranteed bugcheck).
+            pattern = (PFAULT_PATTERN)ExAllocatePoolWithTag(
+                NonPagedPool, sizeof(FAULT_PATTERN), RACE_FUZZER_TAG);
+            if (!pattern) {
+                continue;
+            }
+            RtlZeroMemory(pattern, sizeof(FAULT_PATTERN));
+            pattern->PayloadId = InterlockedIncrement(&g_PatternCounter);
+            pattern->PatternType = FAULT_PATTERN_USE_AFTER_FREE;
+            pattern->SuccessProbability = 70;
+
+            SynthesizeFaultPattern(race, pattern);
         }
     }
-    
+
     KeReleaseSpinLock(&g_RaceLock, oldIrql);
 }
 
@@ -1275,6 +1384,11 @@ NTSTATUS RecordMemoryAccess(PVOID Address, ACCESS_TYPE AccessType,
     return STATUS_SUCCESS;
 }
 
+// NOT WIRED: never called from FuzzingIteration/DetectRaceConditions or any
+// other live path (the sweep in DetectRaceConditions() below walks
+// g_AddrLocksets directly instead of going through this function). Kept as
+// a documented, buildable candidate entry point — not part of the running
+// detector today.
 NTSTATUS AnalyzeLockset(ULONG ThreadId, PVOID MemoryAddress)
 {
     KIRQL oldIrql;
@@ -1337,13 +1451,21 @@ NTSTATUS DetectRaceConditions(VOID)
 
 /*
  * =========================================================
- * Module 3 (continued): Memory Safety Detectors
+ * Module 3 (continued): Memory Safety Detectors — NOT WIRED
  * =========================================================
  *
  * These detectors use a shadow tag table indexed by address hash to record
- * allocation state, initialisation state, and free state. They are
- * consulted on every ACCESS_FREE or ACCESS_WRITE access to detect the
- * common heap-class bugs that often co-occur with race conditions.
+ * allocation state, initialisation state, and free state; the design intent
+ * is to consult them on every ACCESS_FREE or ACCESS_WRITE access to catch
+ * heap-class bugs that often co-occur with race conditions.
+ *
+ * As shipped, none of that is connected: ShadowMark() (which would populate
+ * the table after a real allocation) is never called, so the table stays
+ * empty, and none of DetectUseAfterFree/DetectDoubleFree/
+ * DetectUninitializedMemory/DetectBufferOverflow/DetectNullPointerDeref/
+ * DetectIntegerOverflow is invoked from FuzzingIteration or any other live
+ * path. They compile and are individually correct against the (unused)
+ * shadow table, but they do not run during a fuzzing campaign today.
  *
  * Shadow table: SHADOW_ADDRS slots, linear probing on collision.
  */
@@ -1672,6 +1794,14 @@ NTSTATUS GenerateHeapSpray(PVOID Buffer, ULONG BufferSize, PVOID TargetAddress)
     return STATUS_SUCCESS;
 }
 
+// NOT WIRED: SynthesizeFaultPattern()'s switch only calls
+// GenerateUseAfterFreePattern/GenerateDoubleFreePattern (and its default
+// case hard-codes FAULT_PATTERN_USE_AFTER_FREE); GenerateHeapSprayPattern,
+// GenerateRopChainPattern, GeneratePrivilegeEscalationPattern,
+// GenerateCodeInjectionPattern, CalculatePatternConfidence and
+// ValidateFaultPattern below are never called from that switch or from
+// anywhere else. The five FaultPatternType classes besides UAF/double-free
+// never actually get emitted by a running campaign.
 NTSTATUS GenerateHeapSprayPattern(PRACE_CONDITION Race, PFAULT_PATTERN Pattern)
 {
     if (!Race || !Pattern) return STATUS_INVALID_PARAMETER;
@@ -1779,6 +1909,33 @@ NTSTATUS CalculatePatternConfidence(PRACE_CONDITION Race, PFAULT_PATTERN Pattern
     if (base < 5)  base = 5;
 
     Pattern->SuccessProbability = base;
+    return STATUS_SUCCESS;
+}
+
+// Walks g_PatternList to answer IOCTL_GET_FAULT_PATTERNS. "High confidence"
+// mirrors the >=70 threshold SynthesizeFaultPatterns() assigns UAF records.
+NTSTATUS GetFaultPatternStats(PULONG TotalPatterns, PULONG HighConfidencePatterns)
+{
+    PLIST_ENTRY entry;
+    PFAULT_PATTERN pattern;
+    ULONG total = 0, highConfidence = 0;
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_PatternLock, &oldIrql);
+
+    for (entry = g_PatternList.Flink; entry != &g_PatternList; entry = entry->Flink) {
+        pattern = CONTAINING_RECORD(entry, FAULT_PATTERN, ListEntry);
+        total++;
+        if (pattern->SuccessProbability >= 70) {
+            highConfidence++;
+        }
+    }
+
+    KeReleaseSpinLock(&g_PatternLock, oldIrql);
+
+    if (TotalPatterns) *TotalPatterns = total;
+    if (HighConfidencePatterns) *HighConfidencePatterns = highConfidence;
+
     return STATUS_SUCCESS;
 }
 
@@ -1918,8 +2075,17 @@ NTSTATUS GetCoverageStats(PULONG TotalPoints, PULONG HitPoints, PULONG Percentag
 
 /*
  * =========================================================
- * Module 5 (continued): Mutation Engine & Feedback Loop
+ * Module 5 (continued): Mutation Engine & Feedback Loop — NOT WIRED
  * =========================================================
+ *
+ * AddInput/GetNextInput/MutateInput (and the mutators it dispatches to:
+ * BitFlipMutation, ByteFlipMutation, ArithmeticMutation,
+ * InterestingMutation, HavocMutation, SpliceMutation) and
+ * CalculateCoverageGain/IsInterestingInput are never called from
+ * FuzzingIteration or any other live path. GenerateInput() allocates a
+ * random buffer every iteration but never feeds it into this queue, so
+ * there is no coverage-guided mutation loop running today — the corpus and
+ * mutation machinery below compile but sit idle.
  */
 
 static LONG g_MutSeed = 0x1234;
@@ -2254,13 +2420,22 @@ BOOLEAN IsAddressValid(PVOID Address)
 }
 
 // Clean up resources
+//
+// KNOWN GAP: this does not free g_ThreadList or g_ResourceList (their
+// DestroyFuzzingThread()/DestroyResource() counterparts are declared but
+// never implemented or called). Those allocations now leak instead of
+// dangling/double-freeing (the CRIT use-after-return bugs the review found
+// in CreateFuzzingThreads/CreateFuzzingResources/SynthesizeFaultPatterns
+// have been fixed by heap-allocating their contexts), but full teardown
+// still requires waiting for every worker thread to exit before freeing —
+// see README "Status" / BUILD_AND_VERIFY known fragilities.
 VOID CleanupResources(VOID)
 {
     PLIST_ENTRY entry;
     PCOVERAGE_POINT coveragePoint;
     PFAULT_PATTERN pattern;
     KIRQL oldIrql;
-    
+
     // Clean up coverage points
     KeAcquireSpinLock(&g_CoverageLock, &oldIrql);
     
@@ -2310,6 +2485,12 @@ NTSTATUS CreateFileHandle(PCHAR FileName, PHANDLE FileHandle)
     return STATUS_SUCCESS;
 }
 
+// STUB — NOT IMPLEMENTED: called every iteration via
+// SimulateRaceConditions()->SimulateRaceCondition(), but does nothing. The
+// only race-generating/detecting path that actually runs is
+// ThreadWorker()->SimulateThreadRace() feeding fixed synthetic addresses
+// into the lockset detector, swept by DetectRaceConditions() above; this
+// function is not part of that path.
 NTSTATUS SimulateRaceCondition(ULONG RaceType, PULONG ThreadIds, ULONG ThreadCount)
 {
     UNREFERENCED_PARAMETER(RaceType);

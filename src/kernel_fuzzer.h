@@ -1,8 +1,19 @@
 /*
  * Kernel-Level Race Condition Fuzzing Engine - Header File
- * 
+ *
  * Header for the Windows kernel-mode race condition fuzzing driver.
- * All modules are implemented in kernel_fuzzer.c.
+ *
+ * NOT INCLUDED BY kernel_fuzzer.c: the driver is a single translation unit
+ * that includes only <ntifs.h>/<ntstrsafe.h> and redefines every
+ * struct/enum it needs locally (see the comment at the top of
+ * kernel_fuzzer.c). This header's struct layouts have drifted from those
+ * local definitions (e.g. FUZZING_STATUS here has extra trailing fields
+ * the .c struct lacks) and it also pulls in <windef.h>, a user-mode header
+ * that must not be compiled into a kernel translation unit — so including
+ * it from kernel_fuzzer.c as-is would not build. Treat this file as
+ * reference documentation of the intended IOCTL/struct contract, not as
+ * the compiled source of truth; the .c file's local definitions are
+ * authoritative for the actual driver.
  */
 
 #ifndef KERNEL_FUZZER_H
