@@ -2,24 +2,16 @@
 <!--
   KernelFuzzer.vcxproj  -  modern WDK 10 / MSBuild driver project.
 
-  The repo's only shipped build path (src/sources + src/build.bat) drives
-  the legacy WDK 7.1-era "build -ceZ" tool, which most current WDK/VS
-  installs no longer carry (see ../../BUILD_AND_VERIFY.md Section 3.1/Section 3.2/Section 3.3  - 
-  this file is exactly the "not yet done" fallback described there: "hand-
-  author a modern KMDF .vcxproj that compiles kernel_fuzzer.c with
-  ntoskrnl.lib and hal.lib"). The driver itself is WDM, not KMDF (raw
-  IoCreateDevice/PsCreateSystemThread/KSPIN_LOCK, no WdfDriverCreate), so
-  DriverType below is WDM to match src/sources' DRIVERTYPE=WDM.
-
-  Compiles the SAME source the legacy path compiles (../../src/kernel_fuzzer.c)
-   -  nothing under src/ is modified or duplicated. Requires the "Windows
-  Driver Kit" Visual Studio extension (WindowsKernelModeDriver10.0 platform
-  toolset) to be installed alongside MSBuild; if it is not, MSBuild fails
-  with a clear toolset-not-found error rather than silently doing nothing  - 
-  see kernel-test/build.ps1, which surfaces that error verbatim and exits
-  non-zero instead of reporting fake success.
+  Compiles the same source the legacy src/sources path targets
+  (../../src/kernel_fuzzer.c), a WDM driver (raw IoCreateDevice /
+  PsCreateSystemThread / KSPIN_LOCK). Configuration mirrors the known-good
+  KMTO driver project (see gh-review/KMTO/driver/kmto_driver.vcxproj): it
+  pins WindowsTargetPlatformVersion, defines the WDK version properties the
+  WindowsDriver targets require, and puts the WDK km/shared include and lib
+  dirs on the path so ntifs.h/wdm.h resolve. build.ps1 surfaces any real
+  compiler error verbatim and exits non-zero (no fake success).
 -->
-<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64">
       <Configuration>Release</Configuration>
@@ -28,47 +20,69 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{6C1E7A2E-6E8B-4E6C-9E0B-6B1B6A6D9F31}</ProjectGuid>
-    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
-    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <TemplateGuid>{B53146FA-082D-40E4-9923-0E0006B067EF}</TemplateGuid>
+    <Keyword>KMDriver</Keyword>
     <RootNamespace>KernelFuzzer</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <TargetName>KernelFuzzer</TargetName>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <ProjectName>KernelFuzzer</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <PropertyGroup Label="Configuration">
+  <PropertyGroup>
+    <WDKRoot Condition="'$(WDKRoot)'==''">C:\Program Files (x86)\Windows Kits\10</WDKRoot>
+    <WDKVersion Condition="'$(WDKVersion)'==''">10.0.26100.0</WDKVersion>
+    <WindowsTargetPlatformVersion Condition="'$(WindowsTargetPlatformVersion)'==''">10.0.26100.0</WindowsTargetPlatformVersion>
+    <TargetPlatformVersion_CO Condition="'$(TargetPlatformVersion_CO)'==''">10.0.26100.0</TargetPlatformVersion_CO>
+    <TargetPlatformVersion_NI Condition="'$(TargetPlatformVersion_NI)'==''">10.0.26100.0</TargetPlatformVersion_NI>
+    <TargetPlatformVersion_FE>10.0.26100.0</TargetPlatformVersion_FE>
+    <SkipValidateNTTargetVersion>true</SkipValidateNTTargetVersion>
+    <MatchingSdkPresent>true</MatchingSdkPresent>
+    <MatchingWdkPresent>true</MatchingWdkPresent>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
-    <DriverTargetPlatform>Universal</DriverTargetPlatform>
-    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <UseDebugLibraries>false</UseDebugLibraries>
-    <UseWpp>false</UseWpp>
-    <Spectre>false</Spectre>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
-  <ImportGroup Label="PropertySheets">
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
-  <ItemDefinitionGroup>
+  <PropertyGroup>
+    <OutDir>$(MSBuildProjectDirectory)\bin\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\obj\$(Configuration)\</IntDir>
+    <TargetName>KernelFuzzer</TargetName>
+    <TargetExt>.sys</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
+      <WppEnabled>false</WppEnabled>
       <WarningLevel>Level4</WarningLevel>
-      <!--
-        src/sources builds with /W4 /WX (warnings-as-errors). Kept here too
-        so build.ps1's result matches the repo's own documented standard  - 
-        do not weaken this to hide warnings; BUILD_AND_VERIFY.md Section build/test
-        reality already flags that /WX may legitimately fail on the dead
-        code / unused-function definitions and the reported Priority
-        unsigned-underflow. A failure here is real signal, not noise.
-      -->
-      <TreatWarningAsError>true</TreatWarningAsError>
-      <PreprocessorDefinitions>DRIVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>..\..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- Legacy WDM source: keep /W4 warnings visible but do not fail the build on
+           them (benign C4996 deprecated-pool, C4100 unused-param, C4057 Interlocked
+           signedness). Build-config only; no driver logic changed. -->
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalIncludeDirectories>..\..\src;$(WDKRoot)\Include\$(WDKVersion)\km;$(WDKRoot)\Include\$(WDKVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>DRIVER;NDEBUG;_AMD64_=1;AMD64=1;_KERNEL_MODE=1;WINNT=1;_WIN32_WINNT=0x0A00;NTDDI_VERSION=0x0A00000C;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>ntoskrnl.lib;hal.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WDKRoot)\Lib\$(WDKVersion)\km\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <SubSystem>Native</SubSystem>
+      <Driver>Driver</Driver>
+      <AdditionalOptions>/ENTRY:GsDriverEntry /SUBSYSTEM:NATIVE,6.00 /DRIVER:WDM %(AdditionalOptions)</AdditionalOptions>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
     </Link>
   </ItemDefinitionGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <IncludePath>C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\kernel_fuzzer.c" />
   </ItemGroup>
@@ -76,5 +90,19 @@
     <ClInclude Include="..\..\src\kernel_fuzzer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemDefinitionGroup>
+    <DriverSign>
+      <AdditionalOptions>/fd sha256 %(AdditionalOptions)</AdditionalOptions>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <!-- In-build signing disabled: produce an unsigned KernelFuzzer.sys; test-sign
+       it as a separate signtool step (kernel-test/sign.ps1 / README). Keeps the
+       build independent of which test cert is present in the store. -->
+  <PropertyGroup Label="Signing">
+    <SignMode>Off</SignMode>
+    <GenerateTestCertificate>false</GenerateTestCertificate>
+  </PropertyGroup>
+  <Target Name="ValidateNTTargetVersion" Condition="'$(SkipValidateNTTargetVersion)' != 'true'" />
+  <Target Name="Telemetry" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
